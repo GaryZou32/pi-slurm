@@ -15,6 +15,9 @@ const STATE_ENTRY = "pi-research-engineer-slurm-state";
 const MESSAGE_TYPE = "pi-slurm";
 const EVENT_FINISHED = "slurm:finished";
 const POLL_INTERVAL_MS = 5_000;
+// Consecutive polls where the scheduler is unreachable before the monitor warns
+// (6 polls x 5s = ~30s of silence). A single drop does not spam the session.
+const UNREACHABLE_NOTIFY_THRESHOLD = 6;
 function logRoot(): string {
 	// A project-local default remains visible from a compute node on clusters
 	// where /tmp is node-local. Override when a different shared location is
@@ -59,12 +62,16 @@ type SlurmObservation = {
 	detail: string;
 	terminal: boolean;
 	elapsed?: string;
+	// True when neither squeue nor sacct could be reached (e.g. the SSH link to
+	// the cluster dropped), as opposed to a job that has simply left both views.
+	unreachable?: boolean;
 };
 
 let jobs = new Map<string, TrackedJob>();
 let monitoring = false;
 let monitoringTimer: ReturnType<typeof setInterval> | undefined;
 let agentRunActive = false;
+let consecutiveUnreachable = 0;
 
 type PendingNotification = {
 	content: string;
@@ -236,6 +243,8 @@ function defaultQos(partition: string): string | undefined {
 }
 
 function observe(jobId: string): SlurmObservation {
+	let squeueFailed = false;
+	let sacctFailed = false;
 	try {
 		const queue = run("squeue", ["--noheader", "--jobs", jobId, "--format=%T|%M|%R"]);
 		if (queue) {
@@ -245,6 +254,7 @@ function observe(jobId: string): SlurmObservation {
 		}
 	} catch {
 		// A job that left squeue is queried through accounting below.
+		squeueFailed = true;
 	}
 	try {
 		const accounting = run("sacct", ["--noheader", "--allocations", "--jobs", jobId, "--format=State,ExitCode,Elapsed", "--parsable2"]);
@@ -260,6 +270,13 @@ function observe(jobId: string): SlurmObservation {
 		}
 	} catch {
 		// Scheduler/accounting may be temporarily unavailable.
+		sacctFailed = true;
+	}
+	if (squeueFailed && sacctFailed) {
+		// Both the live queue and accounting were unreachable (for example an SSH
+		// link to the cluster dropped). Mark it so the monitor can warn instead of
+		// staying silent, and so a transient blip is not mistaken for a dead job.
+		return { state: "UNKNOWN", detail: "scheduler unreachable", terminal: false, unreachable: true };
 	}
 	return { state: "UNKNOWN", detail: "not currently visible in squeue or sacct", terminal: false };
 }
@@ -373,9 +390,11 @@ function startMonitor(pi: ExtensionAPI): void {
 	monitoring = true;
 	monitoringTimer = setInterval(() => {
 		let changed = false;
+		let intervalUnreachable = false;
 		for (const job of jobs.values()) {
 			if (isTerminal(job.lastState)) continue;
 			const observation = observe(job.id);
+			if (observation.unreachable) intervalUnreachable = true;
 			if (observation.state !== job.lastState && observation.state !== "UNKNOWN") {
 				const previous = job.lastState;
 				job.lastState = observation.state;
@@ -389,6 +408,12 @@ function startMonitor(pi: ExtensionAPI): void {
 					// elapsed time proves it ran, so do not lose its start notification.
 					job.startedNotified = true;
 					notify(pi, `[SLURM] ${job.name} (${job.id}) started. Log: ${job.logPath}`, { jobId: job.id, status: "RUNNING" });
+				}
+				if (observation.state === "PENDING" && previous === "RUNNING") {
+					// A running job moving back to pending is a requeue (node failure or
+					// preemption). Surface it: the job restarts from scratch, which the
+					// agent must know so it does not assume progress was kept.
+					notify(pi, `[SLURM] ${job.name} (${job.id}) returned to pending (requeued or node failure): ${observation.detail}. Log: ${job.logPath}`, { jobId: job.id, status: "PENDING" });
 				}
 				if (observation.terminal && !job.completionNotified) {
 					job.completionNotified = true;
@@ -405,6 +430,18 @@ function startMonitor(pi: ExtensionAPI): void {
 					notify(pi, `[SLURM] ${job.name} (${job.id}) has been running; inspect its log if useful: ${job.logPath}`, { jobId: job.id, status: "RUNNING" });
 				}
 			}
+		}
+		if (intervalUnreachable) {
+			consecutiveUnreachable += 1;
+			if (consecutiveUnreachable === UNREACHABLE_NOTIFY_THRESHOLD) {
+				const target = sshHost() ? ` over ssh ${sshHost()}` : "";
+				notify(pi, `[SLURM] monitoring lost contact with the scheduler${target}; will resume polling when it responds.`, {});
+			}
+		} else {
+			if (consecutiveUnreachable >= UNREACHABLE_NOTIFY_THRESHOLD) {
+				notify(pi, `[SLURM] monitoring reconnected to the scheduler.`, {});
+			}
+			consecutiveUnreachable = 0;
 		}
 		if (changed) persist(pi);
 	}, POLL_INTERVAL_MS);
@@ -427,6 +464,7 @@ export default function slurm(pi: ExtensionAPI): void {
 		monitoringTimer = undefined;
 		monitoring = false;
 		agentRunActive = false;
+		consecutiveUnreachable = 0;
 		pendingNotifications = [];
 	});
 
@@ -474,6 +512,7 @@ export default function slurm(pi: ExtensionAPI): void {
 			}
 			const partition = params.partition ?? defaultPartition();
 			const qos = params.qos?.trim() || defaultQos(partition);
+			const requeue = process.env.PI_RESEARCH_SLURM_REQUEUE?.trim();
 			const maxTime = partitionMaxTime(partition);
 			const logs = logRoot();
 			if (!isRemote()) {
@@ -488,6 +527,8 @@ export default function slurm(pi: ExtensionAPI): void {
 				"--partition", partition,
 				...(qos ? ["--qos", qos] : []),
 				"--time", maxTime,
+				...(requeue === "1" ? ["--requeue"] : requeue === "0" ? ["--no-requeue"] : []),
+				"--open-mode", "append",
 				"--output", logPath,
 				"--chdir", workingDir,
 				...(params.gpus ? ["--gres", params.gpus] : []),
