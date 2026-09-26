@@ -85,12 +85,37 @@ const TERMINAL_STATES = new Set<JobState>([
 	"INVALID_DEPEND",
 ]);
 
+function sshHost(): string | undefined {
+	return process.env.PI_RESEARCH_SLURM_SSH_HOST?.trim() || undefined;
+}
+
+function isRemote(): boolean {
+	return Boolean(sshHost());
+}
+
+function shellQuote(value: string): string {
+	return "'" + value.replaceAll("'", "'\"'\"'") + "'";
+}
+
 function run(command: string, args: string[], timeout = 10_000): string {
-	return execFileSync(command, args, {
-		encoding: "utf8",
+	const options = {
+		encoding: "utf8" as const,
 		timeout,
 		maxBuffer: 1024 * 1024,
-	}).trim();
+	};
+	const host = sshHost();
+	if (!host) {
+		return execFileSync(command, args, options).trim();
+	}
+	// Remote execution over SSH. Every argument is shell-quoted so the remote
+	// login shell reconstructs them verbatim, including values that contain
+	// spaces, quotes, or shell metacharacters (for example the --wrap string).
+	const remoteCommand = [command, ...args].map(shellQuote).join(" ");
+	return execFileSync(
+		"ssh",
+		["-o", "BatchMode=yes", "-o", "ConnectTimeout=15", host, remoteCommand],
+		options,
+	).trim();
 }
 
 function hasSlurm(): boolean {
@@ -102,8 +127,20 @@ function hasSlurm(): boolean {
 	}
 }
 
-function shellQuote(value: string): string {
-	return "'" + value.replaceAll("'", "'\"'\"'") + "'";
+/**
+ * Rewrite a local (controller) filesystem path onto the cluster filesystem
+ * when submitting remotely. Configure the mapping with
+ * PI_RESEARCH_SLURM_REMOTE_PREFIX_FROM and PI_RESEARCH_SLURM_REMOTE_PREFIX_TO.
+ * Local submissions return the path unchanged.
+ */
+function remotePath(localPath: string): string {
+	if (!isRemote()) return localPath;
+	const from = process.env.PI_RESEARCH_SLURM_REMOTE_PREFIX_FROM?.trim();
+	const to = process.env.PI_RESEARCH_SLURM_REMOTE_PREFIX_TO?.trim();
+	if (!from || !to) return localPath;
+	if (localPath === from) return to;
+	if (localPath.startsWith(from + "/")) return to + localPath.slice(from.length);
+	return localPath;
 }
 
 function normaliseState(value: string): JobState {
@@ -418,14 +455,33 @@ export default function slurm(pi: ExtensionAPI): void {
 			notify_after_minutes: Type.Optional(Type.Number({ minimum: 1, description: "Optional one-off reminder after this many minutes." })),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			if (!hasSlurm()) throw new Error("Slurm is unavailable: sbatch was not found or did not respond.");
+			if (!hasSlurm()) {
+				const host = sshHost();
+				throw new Error(
+					host
+						? `Slurm is unavailable: sbatch was not found or did not respond over ssh host ${host}.`
+						: "Slurm is unavailable: sbatch was not found or did not respond.",
+				);
+			}
+			if (isRemote()) {
+				const from = process.env.PI_RESEARCH_SLURM_REMOTE_PREFIX_FROM?.trim();
+				const to = process.env.PI_RESEARCH_SLURM_REMOTE_PREFIX_TO?.trim();
+				if (!from || !to) {
+					throw new Error(
+						"Remote Slurm submission requires PI_RESEARCH_SLURM_REMOTE_PREFIX_FROM and PI_RESEARCH_SLURM_REMOTE_PREFIX_TO to map the local working directory onto the cluster filesystem.",
+					);
+				}
+			}
 			const partition = params.partition ?? defaultPartition();
 			const qos = params.qos?.trim() || defaultQos(partition);
 			const maxTime = partitionMaxTime(partition);
 			const logs = logRoot();
-			fs.mkdirSync(logs, { recursive: true });
+			if (!isRemote()) {
+				fs.mkdirSync(logs, { recursive: true });
+			}
 			const name = params.name?.trim() || "pi-research";
-			const logPath = path.join(logs, `${name}-%j.out`);
+			const logPath = remotePath(path.join(logs, `${name}-%j.out`));
+			const workingDir = remotePath(process.cwd());
 			const args = [
 				"--parsable",
 				"--job-name", name,
@@ -433,7 +489,7 @@ export default function slurm(pi: ExtensionAPI): void {
 				...(qos ? ["--qos", qos] : []),
 				"--time", maxTime,
 				"--output", logPath,
-				"--chdir", process.cwd(),
+				"--chdir", workingDir,
 				...(params.gpus ? ["--gres", params.gpus] : []),
 				...(params.cpus ? ["--cpus-per-task", params.cpus] : []),
 				...(params.mem ? ["--mem", params.mem] : []),
